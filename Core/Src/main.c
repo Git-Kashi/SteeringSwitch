@@ -554,34 +554,34 @@ void operation() {
   	dif_sin2cos2 = s1_sin2cos2 - s2_sin2cos2;
 
   	if (dif_sin2cos2 >= dif_sin2cos2_s1_side_0_lower && dif_sin2cos2 < dif_sin2cos2_s1_side_0_upper) {
-  		printf("RT0\r\n");
+  		printf("RT0\n");
   		return;
   	} else if (dif_sin2cos2 >= dif_sin2cos2_s1_side_0_upper && dif_sin2cos2 < dif_sin2cos2_s1_side_1_upper) {
-  		printf("RT1\r\n");
+  		printf("RT1\n");
   		return;
   	} else if (dif_sin2cos2 >= dif_sin2cos2_s1_side_1_upper && dif_sin2cos2 < dif_sin2cos2_s1_side_2_upper) {
-  		printf("RT2\r\n");
+  		printf("RT2\n");
   		return;
   	} else if (dif_sin2cos2 >= dif_sin2cos2_s1_side_2_upper && dif_sin2cos2 < dif_sin2cos2_s1_side_3_upper) {
-  		printf("RT3\r\n");
+  		printf("RT3\n");
   		return;
   	} else if (dif_sin2cos2 >= dif_sin2cos2_s1_side_3_upper && dif_sin2cos2 < dif_sin2cos2_s1_side_4_upper) {
-  		printf("RT4\r\n");
+  		printf("RT4\n");
   		return;
   	} else if (dif_sin2cos2 <= dif_sin2cos2_s2_side_0_upper && dif_sin2cos2 > dif_sin2cos2_s2_side_0_lower) {
-  		printf("LT0\r\n");
+  		printf("LT0\n");
   		return;
   	} else if (dif_sin2cos2 <= dif_sin2cos2_s2_side_0_lower && dif_sin2cos2 > dif_sin2cos2_s2_side_1_lower) {
-  		printf("LT1\r\n");
+  		printf("LT1\n");
   		return;
   	} else if (dif_sin2cos2 <= dif_sin2cos2_s2_side_1_lower && dif_sin2cos2 > dif_sin2cos2_s2_side_2_lower) {
-  		printf("LT2\r\n");
+  		printf("LT2\n");
   		return;
   	} else if (dif_sin2cos2 <= dif_sin2cos2_s2_side_2_lower && dif_sin2cos2 > dif_sin2cos2_s2_side_3_lower) {
-  		printf("LT3\r\n");
+  		printf("LT3\n");
   		return;
   	} else if (dif_sin2cos2 <= dif_sin2cos2_s2_side_3_lower && dif_sin2cos2 > dif_sin2cos2_s2_side_4_lower) {
-  		printf("LT4\r\n");
+  		printf("LT4\n");
   		return;
   	}
 
@@ -596,19 +596,19 @@ void operation() {
   	sum_sin2cos2 = s1_sin2cos2 + s2_sin2cos2;
 
   	if (sum_sin2cos2 >= sum_sin2cos2_push_0_lower && sum_sin2cos2 < sum_sin2cos2_push_0_upper) {
-  		printf("PS0\r\n");
+  		printf("PS0\n");
   		return;
   	} else if (sum_sin2cos2 >= sum_sin2cos2_push_0_upper && sum_sin2cos2 < sum_sin2cos2_push_1_upper) {
-  		printf("PS1\r\n");
+  		printf("PS1\n");
   		return;
   	} else if (sum_sin2cos2 >= sum_sin2cos2_push_1_upper && sum_sin2cos2 < sum_sin2cos2_push_2_upper) {
-  		printf("PS2\r\n");
+  		printf("PS2\n");
   		return;
   	} else if (sum_sin2cos2 >= sum_sin2cos2_push_2_upper && sum_sin2cos2 < sum_sin2cos2_push_3_upper) {
-  		printf("PS3\r\n");
+  		printf("PS3\n");
   		return;
   	} else if (sum_sin2cos2 >= sum_sin2cos2_push_3_upper && sum_sin2cos2 < sum_sin2cos2_push_4_upper) {
-  		printf("PS4\r\n");
+  		printf("PS4\n");
   		return;
   	}
 
@@ -663,9 +663,9 @@ void operation() {
 
   	/* STEP11 : S00からS15まで、3文字表現でprintf出力する */
   	if (j < 10) {
-  		printf("S0%d\r\n", j);
+  		printf("S0%d\n", j);
   	} else {
-  		printf("S%d\r\n", j);
+  		printf("S%d\n", j);
   	}
 
   	return;
