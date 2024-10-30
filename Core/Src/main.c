@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32l4xx_hal.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -27,6 +28,10 @@
 #include <unistd.h>
 #include <stdbool.h> // bool型を使用するために必要
 #include <stdlib.h>  // exit関数を使用するために必要
+
+//64bitデータを取り扱うにはコンパイル方式をreduced CからStandard Cに変更させる必要がある
+#include <stdint.h>   // uint64_tの定義用
+#include <inttypes.h> // PRIu64などのフォーマット指定子用
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,6 +40,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define Flash_Page_Size 2048  // 1ページ = 2048バイト（2KB）
+#define FLASH_BASE_ADDR 0x08000000  // Flashメモリの開始アドレス
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -76,16 +83,31 @@ double s1_theta_high[16];    /* calibration時のstdからatanでΘ(theta)を算
 double s2_theta_high[16];    /* calibration時のstdからatanでΘ(theta)を算出し、toleranceを加算した値　sensor2側 */
 
 /* calibration（） で使う　しきい値 */
-double tolerance = 10;    /* 回転角度エリア判定の範囲を指定する変数 */
-
-/* operation() で使う　しきい値 */
-double center_push_threshold = 2.7;    /* 真ん中プッシュと判定するときのしきい値 */
-double left_tilt_threshold = -1.2;    /* 左チルトと判定するときのしきい値 */
-double right_tilt_threshold = 1.2;    /* 右チルトと判定するときのしきい値      240301memo= leftとrightの感度設定が逆になっている!修正必要*/
+double tolerance;    /* 回転角度エリア判定の範囲を指定する変数 */
 
 /* EEPROM格納用配列 */
 double eeprom[1000];    /* すべて倍精度浮動小数点数型doubleで格納。ひとつの数値に8byte使う */
+double flash[512];  // flash2ページ分のアドレス512
 
+// 傾き・押し込み判定スレッショルド
+double dif_sin2cos2_s1_side_0_lower = 0.70;		// S1側 第1領域　下限
+double dif_sin2cos2_s1_side_0_upper = 0.95;		// S1側 第1領域　上限
+double dif_sin2cos2_s1_side_1_upper = 1.20;		// S1側 第2領域　上限
+double dif_sin2cos2_s1_side_2_upper = 1.45;		// S1側 第3領域　上限
+double dif_sin2cos2_s1_side_3_upper = 1.70;		// S1側 第4領域　上限
+double dif_sin2cos2_s1_side_4_upper = 10;		// S1側 第5領域　上現
+double dif_sin2cos2_s2_side_0_upper = -0.70;	// S2側 第1領域　上限
+double dif_sin2cos2_s2_side_0_lower = -0.95;	// S2側　第1領域　下限
+double dif_sin2cos2_s2_side_1_lower = -1.20;	// S2側　第2領域　下限
+double dif_sin2cos2_s2_side_2_lower = -1.45;	// S2側　第3領域　下限
+double dif_sin2cos2_s2_side_3_lower = -1.70;	// S2側　第4領域　下限
+double dif_sin2cos2_s2_side_4_lower = -10;		// S2側　第5領域　下限
+double sum_sin2cos2_push_0_lower = 2.75;	// 押し込み 第1領域 下限
+double sum_sin2cos2_push_0_upper = 3.00;	// 押し込み 第1領域 上限
+double sum_sin2cos2_push_1_upper = 3.25;	// 押し込み 第2領域 上限
+double sum_sin2cos2_push_2_upper = 3.50;	// 押し込み 第3領域 上限
+double sum_sin2cos2_push_3_upper = 3.75;	// 押し込み 第4領域 上限
+double sum_sin2cos2_push_4_upper = 10;		// 押し込み 第5領域 上限
 
 /* USER CODE END PV */
 
@@ -97,6 +119,111 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
+
+// Flashメモリへページ内のデータを保持しつつ、指定アドレスの内容を書き換える関数
+// Flash全体は256KB(=128page*2048byte)
+// Flashメモリの先頭からプログラムに使われるためデータ保存領域は最後の2ページ(2page*2048byte)を使う
+// 127page範囲は0x0803F000から0x0803F7FFまで（2047）。
+// 128page範囲は0x0803F800から0x0803FFFFまで（2047）。
+// 例えば、アドレス0x0803F000に64ビット（8バイト）データを書き込む場合:
+// データ: 0x12345678ABCDEF01（64ビット、8バイト）
+// アドレスの割り当て:
+// アドレス 0x0803F000: 0x01
+// アドレス 0x0803F001: 0xEF
+// アドレス 0x0803F002: 0xCD
+// アドレス 0x0803F003: 0xAB
+// アドレス 0x0803F004: 0x78
+// アドレス 0x0803F005: 0x56
+// アドレス 0x0803F006: 0x34
+// アドレス 0x0803F007: 0x12
+// 引数のaddressは0x0803F000の8バイトの倍数を入力する
+// 引数のnew_dataは16バイトの数値を入力する
+
+/**
+ * 指定したページ、アドレスに64ビットのデータを書き込む関数
+ *
+ * @param page 書き込み対象のページ番号（0～127）
+ * @param address ページ内のアドレス（0～255） -> 8バイト単位でアドレスを指定
+ * @param new_data 書き込みたいデータ（double型）
+ */
+void Flash_Update(uint32_t page, uint32_t address, double new_data) {
+    // 1. ページとアドレスの範囲チェック
+    if (page > 127 || address >= Flash_Page_Size / 8) {
+        printf("Error: Invalid page or address.\r\n");
+        return;
+    }
+
+    // 2. 書き込み対象のページの開始アドレスを計算
+    uint32_t page_start_address = FLASH_BASE_ADDR + (page * Flash_Page_Size);
+
+    // 3. ページ内容をRAMにコピーするためのバッファ（256個の64ビットデータ）
+    uint64_t page_data[Flash_Page_Size / 8];
+
+    // 4. Flashメモリをアンロック
+    HAL_FLASH_Unlock();
+
+    // 5. ページの内容をRAMにコピー
+    for (int i = 0; i < Flash_Page_Size / 8; i++) {
+        page_data[i] = *((uint64_t*)(page_start_address + (i * 8)));
+    }
+
+    // 6. 書き込み対象のデータを更新
+    int offset = address;  // 8バイト単位のアドレスを直接オフセットに使用
+    page_data[offset] = *(uint64_t*)&new_data;  // double型をuint64_t型に変換して格納
+
+    // 7. ページを消去
+    FLASH_EraseInitTypeDef eraseInit;
+    uint32_t pageError = 0;
+
+    eraseInit.TypeErase = FLASH_TYPEERASE_PAGES;
+    eraseInit.Page = page;
+    eraseInit.NbPages = 1;
+
+    if (HAL_FLASHEx_Erase(&eraseInit, &pageError) != HAL_OK) {
+        printf("Error: Flash erase failed.\r\n");
+        HAL_FLASH_Lock();
+        return;
+    }
+
+    // 8. RAMバッファからFlashメモリに書き戻し
+    for (int i = 0; i < Flash_Page_Size / 8; i++) {
+        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                              page_start_address + (i * 8),
+                              page_data[i]) != HAL_OK) {
+            printf("Error: Flash programming failed.\r\n");
+            HAL_FLASH_Lock();
+            return;
+        }
+    }
+
+    // 9. Flashメモリをロック
+    HAL_FLASH_Lock();
+}
+
+
+/**
+ * 指定したページとアドレスから64ビットのデータを読み出す関数
+ *
+ * @param page 読み出し対象のページ番号（0～127）
+ * @param address ページ内のアドレス（0～255） -> 8バイト単位で指定
+ * @return 読み取ったデータ（double型）
+ */
+double Flash_Read(uint32_t page, uint32_t address) {
+    // 1. ページとアドレスの範囲チェック
+    if (page > 127 || address >= Flash_Page_Size / 8) {
+        printf("Error: Invalid page or address.\r\n");
+        return 0.0;  // 無効な入力の場合は0.0を返す
+    }
+
+    // 2. 読み出し対象のアドレスを計算
+    uint32_t target_address = FLASH_BASE_ADDR + (page * Flash_Page_Size) + (address * 8);
+
+    // 3. Flashメモリから64ビットのデータを取得
+    uint64_t raw_data = *(uint64_t*)target_address;
+
+    // 4. 取得したデータをdouble型にキャストして返す
+    return *(double*)&raw_data;
+}
 
 /* printfとscanfを使うためのマクロ設定
  * https://forum.digikey.com/t/stm32-scanf/21448
@@ -133,11 +260,6 @@ void write_double_to_eeprom(double data, uint16_t address) {
     HAL_I2C_Mem_Write(&hi2c1, eeprom_address <<1, address, I2C_MEMADD_SIZE_16BIT, byte_data, sizeof(double), 1000);
     HAL_Delay(5);    // 【重要】 EEPROM書き込み待ち必要時間5ms(max)を待つ
 
-//    Debug用code;
-//    printf("\n[write] input data = %f\n", data);
-//    printf("[write] input address = %d\n", address);
-//    printf("[write] byte_data = %d,%d,%d,%d,%d,%d,%d,%d\n",byte_data[0],byte_data[1],byte_data[2],byte_data[3],byte_data[4],byte_data[5],byte_data[6],byte_data[7]);
-
     /* HAL_I2C_Mem_Write (
      * 	I2C_HandleTypeDef *hi2c,	"&hi2c1" 固定
      * 	uint16_t DevAddress,		スレーブアドレス
@@ -161,17 +283,11 @@ double read_double_from_eeprom(uint16_t address) {
     HAL_I2C_Mem_Read(&hi2c1, eeprom_address <<1, address, I2C_MEMADD_SIZE_16BIT, byte_data, sizeof(double), 1000);
     // バイト配列をdouble型に変換
     memcpy(&data, byte_data, sizeof(double));
-
-//    Debug用code;
-//    printf("\n[read] address = %d", address);
-//    printf("[read] data = %f\n",data);
-//    printf("[read] byte_data = %d,%d,%d,%d,%d,%d,%d,%d\n",byte_data[0],byte_data[1],byte_data[2],byte_data[3],byte_data[4],byte_data[5],byte_data[6],byte_data[7]);
-
     return data;
 }
 
 
-
+// calibration実行関数
 void calibration() {
 
 	char str = '\0';    // 初期値null入れておく
@@ -179,32 +295,43 @@ void calibration() {
 	uint8_t s2_bxyz[7] = {0};    /* 7byte生データ(ST, Bx x2, By x2, Bz x2) の読み値 sensor2側*/
 
 	fflush(stdin);    // ひとつまえの命令の改行文字が残っているのでクリア
-    printf("\n|| calibration mode ||\n");
+    printf("|| calibration mode ||\r\n");
 
     /* STEP1 : キータッチとホイール回転を16回繰り返して１周分のBx,By,Bzを取得 */
     for (int i = 0; i < 16; i++) {
-        printf("press the Enter key to get (bx%d, by%d, bz%d).\n", i, i, i);
+        printf("press the Enter key to get (bx%d, by%d, bz%d).\r\n", i, i, i);
         scanf("%c", &str);    // どのキーを押してもscanfから抜けられる
-        HAL_I2C_Mem_Read(&hi2c1, dev_address_1 <<1, 0x17, 1, s1_bxyz, 7, 1000);
-        s1_raw_bx[i] = (s1_bxyz[5] << 8) | s1_bxyz[6];
-        s1_raw_by[i] = (s1_bxyz[3] << 8) | s1_bxyz[4];
-        s1_raw_bz[i] = (s1_bxyz[1] << 8) | s1_bxyz[2];
-        HAL_I2C_Mem_Read(&hi2c1, dev_address_2 <<1, 0x17, 1, s2_bxyz, 7, 1000);
+
+        if (HAL_I2C_Mem_Read(&hi2c1, dev_address_1 <<1, 0x17, 1, s1_bxyz, 7, 1000) != HAL_OK) {
+        	printf("I2C read failed for device 1. \r\n");
+        	uint32_t error = HAL_I2C_GetError(&hi2c1);
+        	printf("I2C Error: %lu\r\n", error);
+        } else {
+        	s1_raw_bx[i] = (s1_bxyz[5] << 8) | s1_bxyz[6];
+        	s1_raw_by[i] = (s1_bxyz[3] << 8) | s1_bxyz[4];
+        	s1_raw_bz[i] = (s1_bxyz[1] << 8) | s1_bxyz[2];
+        }
+
+        if (HAL_I2C_Mem_Read(&hi2c1, dev_address_2 <<1, 0x17, 1, s2_bxyz, 7, 1000) != HAL_OK) {
+        	printf("I2C read failed for device 2. \r\n");
+        } else {
         s2_raw_bx[i] = (s2_bxyz[5] << 8) | s2_bxyz[6];
         s2_raw_by[i] = (s2_bxyz[3] << 8) | s2_bxyz[4];
         s2_raw_bz[i] = (s2_bxyz[1] << 8) | s2_bxyz[2];
+        }
 
-        printf("Collected data s1(%d, %d, %d).\n", s1_raw_bx[i], s1_raw_by[i], s1_raw_bz[i]);
-        printf("Collected data s2(%d, %d, %d).\n", s2_raw_bx[i], s2_raw_by[i], s2_raw_bz[i]);
+        printf("Collected data s1(%d, %d, %d).\r\n", s1_raw_bx[i], s1_raw_by[i], s1_raw_bz[i]);
+        printf("Collected data s2(%d, %d, %d).\r\n", s2_raw_bx[i], s2_raw_by[i], s2_raw_bz[i]);
     }
 
-    printf("\n");
+    printf("\r\n");
     for (int i = 0; i < 16; i++) {
-        printf("(s1_raw_bx, s1_raw_bz) = (%d, %d)\n", s1_raw_bx[i], s1_raw_bz[i]);
+        printf("(s1_raw_bx, s1_raw_bz) = (%d, %d)\r\n", s1_raw_bx[i], s1_raw_bz[i]);
     }
-    printf("\n");
+
+    printf("\r\n");
     for (int i = 0; i < 16; i++) {
-        printf("(s2_raw_bx, s2_raw_bz) = (%d, %d)\n", s2_raw_bx[i], s2_raw_bz[i]);
+        printf("(s2_raw_bx, s2_raw_bz) = (%d, %d)\r\n", s2_raw_bx[i], s2_raw_bz[i]);
     }
 
     /* STEP2 : Bx,By,Bzの最大値と最小値の配列番号（インデックス）を取得 */
@@ -343,23 +470,24 @@ void calibration() {
     }
 
     /* STEP9 : Θ(theta)データを出力 */
-    printf("\n");
-    printf("s1\n");
-    printf("Θ_low, Θ_center, Θ_high\n");
+    printf("\r\n");
+    printf("s1\r\n");
+    printf("Θ_low, Θ_center, Θ_high\r\n");
     for (int i = 0; i < 16; i++) {
-    	printf("%lf, %lf, %lf\n", s1_theta_low[i], s1_theta[i], s1_theta_high[i]);
+    	printf("%lf, %lf, %lf\r\n", s1_theta_low[i], s1_theta[i], s1_theta_high[i]);
     }
-    printf("\n");
-    printf("s2\n");
-    printf("Θ_low, Θ_center, Θ_high\n");
+    printf("\r\n");
+    printf("s2\r\n");
+    printf("Θ_low, Θ_center, Θ_high\r\n");
     for (int i = 0; i < 16; i++) {
-    	printf("%lf, %lf, %lf\n", s2_theta_low[i], s2_theta[i], s2_theta_high[i]);
+    	printf("%lf, %lf, %lf\r\n", s2_theta_low[i], s2_theta[i], s2_theta_high[i]);
     }
 
     return;
 }
 
 
+// プログラム実行
 void operation() {
 
 	/* STEP1 : 生データraw, オフセットoffset, 振幅p2p, 規格化データstdとそのsin^2+cos^2 の 変数定義 */
@@ -408,100 +536,79 @@ void operation() {
   	s1_sin2cos2 = pow(s1_std_bx_op,2) + pow(s1_std_bz_op,2);    /* 乗数を作るpow関数の戻り値はdouble型 */
   	s2_sin2cos2 = pow(s2_std_bx_op,2) + pow(s2_std_bz_op,2);
 
-
-//  	/* STEP5 : チルト判定 */
-//  	dif_sin2cos2 = s1_sin2cos2 - s2_sin2cos2;
-//  	if (dif_sin2cos2 < left_tilt_threshold) {
-//  		printf("RTL\n");
-//  		return;
-//  	} else if (dif_sin2cos2 > right_tilt_threshold) {
-//  		printf("LTL\n");
-//  		return;
-//  	}
-
-
   	/* STEP5-1 : 左右チルト5段階判定 */
-	double dif_sin2cos2_s1_side_0_lower = 0.70;		// S1側 第1領域　下限
-	double dif_sin2cos2_s1_side_0_upper = 0.95;		// S1側 第1領域　上限
-	double dif_sin2cos2_s1_side_1_upper = 1.20;		// S1側 第2領域　上限
-	double dif_sin2cos2_s1_side_2_upper = 1.45;		// S1側 第3領域　上限
-	double dif_sin2cos2_s1_side_3_upper = 1.70;		// S1側 第4領域　上限
-	double dif_sin2cos2_s1_side_4_upper = 10;		// S1側 第5領域　上現
-
-	double dif_sin2cos2_s2_side_0_upper = -0.70;	// S2側 第1領域　上限
-	double dif_sin2cos2_s2_side_0_lower = -0.95;	// S2側　第1領域　下限
-	double dif_sin2cos2_s2_side_1_lower = -1.20;	// S2側　第2領域　下限
-	double dif_sin2cos2_s2_side_2_lower = -1.45;	// S2側　第3領域　下限
-	double dif_sin2cos2_s2_side_3_lower = -1.70;	// S2側　第4領域　下限
-	double dif_sin2cos2_s2_side_4_lower = -10;		// S2側　第5領域　下限
+//	double dif_sin2cos2_s1_side_0_lower = 0.70;		// S1側 第1領域　下限
+//	double dif_sin2cos2_s1_side_0_upper = 0.95;		// S1側 第1領域　上限
+//	double dif_sin2cos2_s1_side_1_upper = 1.20;		// S1側 第2領域　上限
+//	double dif_sin2cos2_s1_side_2_upper = 1.45;		// S1側 第3領域　上限
+//	double dif_sin2cos2_s1_side_3_upper = 1.70;		// S1側 第4領域　上限
+//	double dif_sin2cos2_s1_side_4_upper = 10;		// S1側 第5領域　上現
+//
+//	double dif_sin2cos2_s2_side_0_upper = -0.70;	// S2側 第1領域　上限
+//	double dif_sin2cos2_s2_side_0_lower = -0.95;	// S2側　第1領域　下限
+//	double dif_sin2cos2_s2_side_1_lower = -1.20;	// S2側　第2領域　下限
+//	double dif_sin2cos2_s2_side_2_lower = -1.45;	// S2側　第3領域　下限
+//	double dif_sin2cos2_s2_side_3_lower = -1.70;	// S2側　第4領域　下限
+//	double dif_sin2cos2_s2_side_4_lower = -10;		// S2側　第5領域　下限
 
   	dif_sin2cos2 = s1_sin2cos2 - s2_sin2cos2;
 
   	if (dif_sin2cos2 >= dif_sin2cos2_s1_side_0_lower && dif_sin2cos2 < dif_sin2cos2_s1_side_0_upper) {
-  		printf("RT0\n");
+  		printf("RT0\r\n");
   		return;
   	} else if (dif_sin2cos2 >= dif_sin2cos2_s1_side_0_upper && dif_sin2cos2 < dif_sin2cos2_s1_side_1_upper) {
-  		printf("RT1\n");
+  		printf("RT1\r\n");
   		return;
   	} else if (dif_sin2cos2 >= dif_sin2cos2_s1_side_1_upper && dif_sin2cos2 < dif_sin2cos2_s1_side_2_upper) {
-  		printf("RT2\n");
+  		printf("RT2\r\n");
   		return;
   	} else if (dif_sin2cos2 >= dif_sin2cos2_s1_side_2_upper && dif_sin2cos2 < dif_sin2cos2_s1_side_3_upper) {
-  		printf("RT3\n");
+  		printf("RT3\r\n");
   		return;
   	} else if (dif_sin2cos2 >= dif_sin2cos2_s1_side_3_upper && dif_sin2cos2 < dif_sin2cos2_s1_side_4_upper) {
-  		printf("RT4\n");
+  		printf("RT4\r\n");
   		return;
   	} else if (dif_sin2cos2 <= dif_sin2cos2_s2_side_0_upper && dif_sin2cos2 > dif_sin2cos2_s2_side_0_lower) {
-  		printf("LT0\n");
+  		printf("LT0\r\n");
   		return;
   	} else if (dif_sin2cos2 <= dif_sin2cos2_s2_side_0_lower && dif_sin2cos2 > dif_sin2cos2_s2_side_1_lower) {
-  		printf("LT1\n");
+  		printf("LT1\r\n");
   		return;
   	} else if (dif_sin2cos2 <= dif_sin2cos2_s2_side_1_lower && dif_sin2cos2 > dif_sin2cos2_s2_side_2_lower) {
-  		printf("LT2\n");
+  		printf("LT2\r\n");
   		return;
   	} else if (dif_sin2cos2 <= dif_sin2cos2_s2_side_2_lower && dif_sin2cos2 > dif_sin2cos2_s2_side_3_lower) {
-  		printf("LT3\n");
+  		printf("LT3\r\n");
   		return;
   	} else if (dif_sin2cos2 <= dif_sin2cos2_s2_side_3_lower && dif_sin2cos2 > dif_sin2cos2_s2_side_4_lower) {
-  		printf("LT4\n");
+  		printf("LT4\r\n");
   		return;
   	}
 
-
-//  	/* STEP6 : プッシュ判定 */
-//  	sum_sin2cos2 = s1_sin2cos2 + s2_sin2cos2;
-//  	if (sum_sin2cos2 > center_push_threshold) {
-//  		printf("PSH\n");
-//  		return;
-//  	}
-
-
   	/* STEP6-1 : プッシュ5段階判定 */
-  	double sum_sin2cos2_push_0_lower = 2.75;	// 押し込み 第1領域 下限
-  	double sum_sin2cos2_push_0_upper = 3.00;	// 押し込み 第1領域 上限
-  	double sum_sin2cos2_push_1_upper = 3.25;	// 押し込み 第2領域 上限
-  	double sum_sin2cos2_push_2_upper = 3.50;	// 押し込み 第3領域 上限
-  	double sum_sin2cos2_push_3_upper = 3.75;	// 押し込み 第4領域 上限
-  	double sum_sin2cos2_push_4_upper = 10;		// 押し込み 第5領域 上限
+//  	double sum_sin2cos2_push_0_lower = 2.75;	// 押し込み 第1領域 下限
+//  	double sum_sin2cos2_push_0_upper = 3.00;	// 押し込み 第1領域 上限
+//  	double sum_sin2cos2_push_1_upper = 3.25;	// 押し込み 第2領域 上限
+//  	double sum_sin2cos2_push_2_upper = 3.50;	// 押し込み 第3領域 上限
+//  	double sum_sin2cos2_push_3_upper = 3.75;	// 押し込み 第4領域 上限
+//  	double sum_sin2cos2_push_4_upper = 10;		// 押し込み 第5領域 上限
 
   	sum_sin2cos2 = s1_sin2cos2 + s2_sin2cos2;
 
   	if (sum_sin2cos2 >= sum_sin2cos2_push_0_lower && sum_sin2cos2 < sum_sin2cos2_push_0_upper) {
-  		printf("PS0\n");
+  		printf("PS0\r\n");
   		return;
   	} else if (sum_sin2cos2 >= sum_sin2cos2_push_0_upper && sum_sin2cos2 < sum_sin2cos2_push_1_upper) {
-  		printf("PS1\n");
+  		printf("PS1\r\n");
   		return;
   	} else if (sum_sin2cos2 >= sum_sin2cos2_push_1_upper && sum_sin2cos2 < sum_sin2cos2_push_2_upper) {
-  		printf("PS2\n");
+  		printf("PS2\r\n");
   		return;
   	} else if (sum_sin2cos2 >= sum_sin2cos2_push_2_upper && sum_sin2cos2 < sum_sin2cos2_push_3_upper) {
-  		printf("PS3\n");
+  		printf("PS3\r\n");
   		return;
   	} else if (sum_sin2cos2 >= sum_sin2cos2_push_3_upper && sum_sin2cos2 < sum_sin2cos2_push_4_upper) {
-  		printf("PS4\n");
+  		printf("PS4\r\n");
   		return;
   	}
 
@@ -556,9 +663,9 @@ void operation() {
 
   	/* STEP11 : S00からS15まで、3文字表現でprintf出力する */
   	if (j < 10) {
-  		printf("S0%d\n", j);
+  		printf("S0%d\r\n", j);
   	} else {
-  		printf("S%d\n", j);
+  		printf("S%d\r\n", j);
   	}
 
   	return;
@@ -566,90 +673,30 @@ void operation() {
 
 
 
-
 void com_debug() {
     for (uint8_t address = 1; address < 128; address++) {
         // HAL_I2C_IsDeviceReady関数を使用してデバイスが応答するかどうかを確認
         if (HAL_I2C_IsDeviceReady(&hi2c1, address << 1, 1, 1000) == HAL_OK) {
-            printf("Device found at address: 0x%02X\n", address);
+            printf("Device found at address: 0x%02X\r\n", address);
         }
     }
 }
 
 
-void sense_adjust() {
+void tolerance_setting() {
 	char temp1[100];
-	char temp2[100];
-	char temp3[100];
-
-	printf("\n\nCurrent setting\n");
-	printf("Sensitivity of center push = %f\n", center_push_threshold);
-	printf("Sensitivity of left tilt = %f\n", left_tilt_threshold);
-	printf("Sensitivity of right tilt = %f\n", right_tilt_threshold);
-
-	printf("\nnew sensitivity of center push ? = ");
+	printf("Current tolerance setting = %lf\r\n", tolerance);
+	printf("new sensitivity of center push ? = \r\n");
 	scanf("%s", temp1);
-	printf("%s\n", temp1);
-	printf("new sensitivity of left tilt ? = ");
-	scanf("%s", temp2);
-	printf("%s\n", temp2);
-	printf("new sensitivity of right tilt ? = ");
-	scanf("%s", temp3);
-	printf("%s\n", temp3);
-
-	center_push_threshold = atof(temp1);
-	left_tilt_threshold = atof(temp2);
-	right_tilt_threshold = atof(temp3);
-	printf("\nsensitivity_center: %f\n", center_push_threshold);
-	printf("sensitivity_left: %f\n", left_tilt_threshold);
-	printf("sensitivity_right: %f\n", right_tilt_threshold);
+	printf("%s\r\n", temp1);
+	tolerance = atof(temp1);
+	printf("new tolerance = %lf\r\n", tolerance);
 }
 
+
 void eeprom_read() {
-
-	/* [Memory map]
-	 * x[0];		tolerance
-	 * x[1];		center_push_threshold
-	 * x[2];		left_tilt_threshold
-	 * x[3];		right_tilt_threshold
-	 *
-	 * x[4:19];		s1_raw_bx[0:15];
-	 * x[20:35];	s1_raw_by[0:15];
-	 * x[36:51];	s1_raw_bz[0:15];
-	 * x[52:67];	s2_raw_bx[0:15];
-	 * x[68:83]; 	s2_raw_by[0:15];
-	 * x[84:99]; 	s2_raw_bz[0:15];
-	 *
-	 * x[100:102];	s1_raw_bx_p2p,s1_raw_by_p2p,s1_raw_bz_p2p;
-	 * x[103:105];	s1_raw_bx_offset,s1_raw_by_offset,s1_raw_bz_offset;
-	 * x[106:108];	s2_raw_bx_p2p,s2_raw_by_p2p,s2_raw_bz_p2p;
-	 * x[109:111];	s2_raw_bx_offset,s2_raw_by_offset,s2_raw_bz_offset;
-	 *
-	 * x[112:127];	s1_std_bx[0:15];
-	 * x[128:143];	s1_std_by[0:15];
-	 * x[144:159];	s1_std_bz[0:15];
-	 * x[160:175];	s2_std_bx[0:15];
-	 * x[176:191];	s2_std_by[0:15];
-	 * x[192:207];	s2_std_bz[0:15];
-	 *
-	 * x[208:223];	s1_atan[0:15];
-	 * x[224:239];	s2_atan[0:15];
-	 * x[240:255];	s1_std_bx_sign[0:15];
-	 * x[256:271];	s2_std_bx_sign[0:15];
-	 *
-	 * x[272:287];	s1_theta[0:15];
-	 * x[288:303];	s2_theta[0:15]
-	 * x[304:319];	s1_theta_low[0:15];
-	 * x[320:335];	s2_thetta_low[0:15];
-	 * x[336:351];	s1_theta_high[0:15];
-	 * x[352:367];	s2_theta_high[0:15];
-	 *
-	 * 合計 8 bytes x 368 変数 = 2,944 bytes
-	 * */
-
 	uint16_t i;
 	uint16_t j;
-
 	for(i=0; i<368; i++) {
 		j = i * sizeof(double);
 		eeprom[i]=read_double_from_eeprom(j);
@@ -657,134 +704,152 @@ void eeprom_read() {
 }
 
 
-void eeprom_write() {
+void load_from_flash (){
+	uint16_t i;
+	for(i=0; i<16; i++) {
+		s1_raw_bx[i] = Flash_Read(126,i);
+		s1_raw_by[i] = Flash_Read(126,i+16);
+		s1_raw_bz[i] = Flash_Read(126,i+32);
+		s2_raw_bx[i] = Flash_Read(126,i+48);
+		s2_raw_by[i] = Flash_Read(126,i+64);
+		s2_raw_bz[i] = Flash_Read(126,i+80);
+		s1_std_bx[i] = Flash_Read(126,i+108);
+		s1_std_by[i] = Flash_Read(126,i+124);
+		s1_std_bz[i] = Flash_Read(126,i+140);
+		s2_std_bx[i] = Flash_Read(126,i+156);
+		s2_std_by[i] = Flash_Read(126,i+172);
+		s2_std_bz[i] = Flash_Read(126,i+188);
+		s1_atan[i] = Flash_Read(126,i+204);
+		s2_atan[i] = Flash_Read(126,i+220);
+		s1_std_bx_sign[i] = Flash_Read(126,i+236);
+		s2_std_bx_sign[i] = Flash_Read(127,i);
+		s1_theta[i] = Flash_Read(127,i+16);
+		s2_theta[i] = Flash_Read(127,i+32);
+		s1_theta_low[i] = Flash_Read(127,i+48);
+		s2_theta_low[i] = Flash_Read(127,i+64);
+		s1_theta_high[i] = Flash_Read(127,i+80);
+		s2_theta_high[i] = Flash_Read(127,i+96);
+	}
 
-    uint16_t i,j,k,l,m,n,p;
-
-    write_double_to_eeprom(tolerance, 0*sizeof(double));
-    write_double_to_eeprom(center_push_threshold, 1*sizeof(double));
-    write_double_to_eeprom(left_tilt_threshold, 2*sizeof(double));
-    write_double_to_eeprom(right_tilt_threshold, 3*sizeof(double));
-
-    for (i=0; i<16; i++) {
-
-        // x[4:19] = s1_raw_bx[0:15]
-    	j=(4+i)*sizeof(double);
-    	write_double_to_eeprom(s1_raw_bx[i], j);   // 32,33,34,35,36,37,38,39 --> 40,41,42,43,44,45,46,47 -->
-
-    	// x[20:35] = s1_raw_by[0:15]
-    	k=(20+i)*sizeof(double);
-    	write_double_to_eeprom(s1_raw_by[i], k);   // 160,
-
-    	// x[36:51] = s1_raw_bz[0:15]
-    	l=(36+i)*sizeof(double);
-    	write_double_to_eeprom(s1_raw_bz[i], l);
-
-        // x[52:67] = s2_raw_bx[0:15]
-    	m=(52+i)*sizeof(double);
-    	write_double_to_eeprom(s2_raw_bx[i], m);
-
-    	// x[68:83] = s2_raw_by[0:15]
-    	n=(68+i)*sizeof(double);
-    	write_double_to_eeprom(s2_raw_by[i], n);
-
-    	// x[84:99] = s2_raw_bz[0:15]
-    	p=(84+i)*sizeof(double);
-    	write_double_to_eeprom(s2_raw_bz[i], p);
-
-    }
-
-    write_double_to_eeprom(s1_raw_bx_p2p, 100*sizeof(double));
-    write_double_to_eeprom(s1_raw_by_p2p, 101*sizeof(double));
-    write_double_to_eeprom(s1_raw_bz_p2p, 102*sizeof(double));
-    write_double_to_eeprom(s1_raw_bx_offset, 103*sizeof(double));
-    write_double_to_eeprom(s1_raw_by_offset, 104*sizeof(double));
-    write_double_to_eeprom(s1_raw_bz_offset, 105*sizeof(double));
-    write_double_to_eeprom(s2_raw_bx_p2p, 106*sizeof(double));
-    write_double_to_eeprom(s2_raw_by_p2p, 107*sizeof(double));
-    write_double_to_eeprom(s2_raw_bz_p2p, 108*sizeof(double));
-    write_double_to_eeprom(s2_raw_bx_offset, 109*sizeof(double));
-    write_double_to_eeprom(s2_raw_by_offset, 110*sizeof(double));
-    write_double_to_eeprom(s2_raw_bz_offset, 111*sizeof(double));
-
-    for (i=0; i<16; i++) {
-
-        // x[112:127] = s1_std_bx[0:15]
-    	j=(112+i)*sizeof(double);
-    	write_double_to_eeprom(s1_std_bx[i], j);
-
-    	// x[128:143] = s1_std_by[0:15]
-    	k=(128+i)*sizeof(double);
-    	write_double_to_eeprom(s1_std_by[i], k);
-
-    	// x[144:159] = s1_std_bz[0:15]
-    	l=(144+i)*sizeof(double);
-    	write_double_to_eeprom(s1_std_bz[i], l);
-
-        // x[160:175] = s2_std_bx[0:15]
-    	m=(160+i)*sizeof(double);
-    	write_double_to_eeprom(s2_std_bx[i], m);
-
-    	// x[176:191] = s2_std_by[0:15]
-    	n=(176+i)*sizeof(double);
-    	write_double_to_eeprom(s2_std_by[i], n);
-
-    	// x[192:207] = s2_std_bz[0:15]
-    	p=(192+i)*sizeof(double);
-    	write_double_to_eeprom(s2_std_bz[i], p);
-
-    }
-
-    for (i=0; i<16; i++) {
-
-        // x[208:223] = s1_atan[0:15]
-    	j=(208+i)*sizeof(double);
-    	write_double_to_eeprom(s1_atan[i], j);
-
-    	// x[224:239] = s2_atan[0:15]
-    	k=(224+i)*sizeof(double);
-    	write_double_to_eeprom(s2_atan[i], k);
-
-    	// x[240:255] = s1_std_bx_sign[0:15]
-    	l=(240+i)*sizeof(double);
-    	write_double_to_eeprom(s1_std_bx_sign[i], l);
-
-        // x[256:271] = s2_std_bx_sign[0:15]
-    	m=(256+i)*sizeof(double);
-    	write_double_to_eeprom(s2_std_bx_sign[i], m);
-
-    }
-
-
-    for (i=0; i<16; i++) {
-
-        // x[272:287] = s1_theta[0:15]
-    	j=(272+i)*sizeof(double);
-    	write_double_to_eeprom(s1_theta[i], j);
-
-    	// x[288:303] = s2_theta[0:15]
-    	k=(288+i)*sizeof(double);
-    	write_double_to_eeprom(s2_theta[i], k);
-
-    	// x[304:319] = s1_theta_low[0:15]
-    	l=(304+i)*sizeof(double);
-    	write_double_to_eeprom(s1_theta_low[i], l);
-
-        // x[320:335] = s2_theta_low[0:15]
-    	m=(320+i)*sizeof(double);
-    	write_double_to_eeprom(s2_theta_low[i], m);
-
-    	// x[336:351] = s1_theta_high[0:15]
-    	n=(336+i)*sizeof(double);
-    	write_double_to_eeprom(s1_theta_high[i], n);
-
-    	// x[352:367] = s2_theta_high[0:15]
-    	p=(352+i)*sizeof(double);
-    	write_double_to_eeprom(s2_theta_high[i], p);
-
-    }
-
+	s1_raw_bx_p2p = Flash_Read(126,96);
+	s1_raw_by_p2p = Flash_Read(126,97);
+	s1_raw_bz_p2p = Flash_Read(126,98);
+	s1_raw_bx_offset = Flash_Read(126,99);
+	s1_raw_by_offset = Flash_Read(126,100);
+	s1_raw_bz_offset = Flash_Read(126,101);
+	s2_raw_bx_p2p = Flash_Read(126,102);
+	s2_raw_by_p2p = Flash_Read(126,103);
+	s2_raw_bz_p2p = Flash_Read(126,104);
+	s2_raw_bx_offset = Flash_Read(126,105);
+	s2_raw_by_offset = Flash_Read(126,106);
+	s2_raw_bz_offset = Flash_Read(126,107);
+	tolerance = Flash_Read(127,112);
+	dif_sin2cos2_s1_side_0_lower = Flash_Read(127,113);
+	dif_sin2cos2_s1_side_0_upper = Flash_Read(127,114);
+	dif_sin2cos2_s1_side_1_upper = Flash_Read(127,115);
+	dif_sin2cos2_s1_side_2_upper = Flash_Read(127,116);
+	dif_sin2cos2_s1_side_3_upper = Flash_Read(127,117);
+	dif_sin2cos2_s1_side_4_upper = Flash_Read(127,118);
+	dif_sin2cos2_s2_side_0_lower = Flash_Read(127,119);
+	dif_sin2cos2_s2_side_0_upper = Flash_Read(127,120);
+	dif_sin2cos2_s2_side_1_lower = Flash_Read(127,121);
+	dif_sin2cos2_s2_side_2_lower = Flash_Read(127,122);
+	dif_sin2cos2_s2_side_3_lower = Flash_Read(127,123);
+	dif_sin2cos2_s2_side_4_lower = Flash_Read(127,124);
+	sum_sin2cos2_push_0_lower = Flash_Read(127,125);
+	sum_sin2cos2_push_0_upper = Flash_Read(127,126);
+	sum_sin2cos2_push_1_upper = Flash_Read(127,127);
+	sum_sin2cos2_push_2_upper = Flash_Read(127,128);
+	sum_sin2cos2_push_3_upper = Flash_Read(127,129);
+	sum_sin2cos2_push_4_upper = Flash_Read(127,130);
 }
+
+
+void store_to_flash() {
+    uint16_t i;
+
+    // 1. Flashメモリをアンロック
+    HAL_FLASH_Unlock();
+
+    // 2. Flashページ126と127の消去準備
+    FLASH_EraseInitTypeDef eraseInit;
+    uint32_t pageError = 0;
+
+    eraseInit.TypeErase = FLASH_TYPEERASE_PAGES;
+    eraseInit.Page = 126;  // 最初のページ
+    eraseInit.NbPages = 2; // 126と127の2ページを消去
+
+    // ページ消去の実行
+    if (HAL_FLASHEx_Erase(&eraseInit, &pageError) != HAL_OK) {
+        printf("Flash erase failed.\r\n");
+        HAL_FLASH_Lock();
+        return;
+    }
+
+    // 3. Flashにデータを書き込み
+    for (i = 0; i < 16; i++) {
+        Flash_Update(126, i, s1_raw_bx[i]);
+        Flash_Update(126, i + 16, s1_raw_by[i]);
+        Flash_Update(126, i + 32, s1_raw_bz[i]);
+        Flash_Update(126, i + 48, s2_raw_bx[i]);
+        Flash_Update(126, i + 64, s2_raw_by[i]);
+        Flash_Update(126, i + 80, s2_raw_bz[i]);
+        Flash_Update(126, i + 108, s1_std_bx[i]);
+        Flash_Update(126, i + 124, s1_std_by[i]);
+        Flash_Update(126, i + 140, s1_std_bz[i]);
+        Flash_Update(126, i + 156, s2_std_bx[i]);
+        Flash_Update(126, i + 172, s2_std_by[i]);
+        Flash_Update(126, i + 188, s2_std_bz[i]);
+        Flash_Update(126, i + 204, s1_atan[i]);
+        Flash_Update(126, i + 220, s2_atan[i]);
+        Flash_Update(126, i + 236, s1_std_bx_sign[i]);
+        Flash_Update(127, i, s2_std_bx_sign[i]);
+        Flash_Update(127, i + 16, s1_theta[i]);
+        Flash_Update(127, i + 32, s2_theta[i]);
+        Flash_Update(127, i + 48, s1_theta_low[i]);
+        Flash_Update(127, i + 64, s2_theta_low[i]);
+        Flash_Update(127, i + 80, s1_theta_high[i]);
+        Flash_Update(127, i + 96, s2_theta_high[i]);
+    }
+
+    // 4. その他のデータの書き込み
+    Flash_Update(126, 96, s1_raw_bx_p2p);
+    Flash_Update(126, 97, s1_raw_by_p2p);
+    Flash_Update(126, 98, s1_raw_bz_p2p);
+    Flash_Update(126, 99, s1_raw_bx_offset);
+    Flash_Update(126, 100, s1_raw_by_offset);
+    Flash_Update(126, 101, s1_raw_bz_offset);
+    Flash_Update(126, 102, s2_raw_bx_p2p);
+    Flash_Update(126, 103, s2_raw_by_p2p);
+    Flash_Update(126, 104, s2_raw_bz_p2p);
+    Flash_Update(126, 105, s2_raw_bx_offset);
+    Flash_Update(126, 106, s2_raw_by_offset);
+    Flash_Update(126, 107, s2_raw_bz_offset);
+
+    Flash_Update(127, 112, tolerance);
+    Flash_Update(127, 113, dif_sin2cos2_s1_side_0_lower);
+    Flash_Update(127, 114, dif_sin2cos2_s1_side_0_upper);
+    Flash_Update(127, 115, dif_sin2cos2_s1_side_1_upper);
+    Flash_Update(127, 116, dif_sin2cos2_s1_side_2_upper);
+    Flash_Update(127, 117, dif_sin2cos2_s1_side_3_upper);
+    Flash_Update(127, 118, dif_sin2cos2_s1_side_4_upper);
+    Flash_Update(127, 119, dif_sin2cos2_s2_side_0_lower);
+    Flash_Update(127, 120, dif_sin2cos2_s2_side_0_upper);
+    Flash_Update(127, 121, dif_sin2cos2_s2_side_1_lower);
+    Flash_Update(127, 122, dif_sin2cos2_s2_side_2_lower);
+    Flash_Update(127, 123, dif_sin2cos2_s2_side_3_lower);
+    Flash_Update(127, 124, dif_sin2cos2_s2_side_4_lower);
+    Flash_Update(127, 125, sum_sin2cos2_push_0_lower);
+    Flash_Update(127, 126, sum_sin2cos2_push_0_upper);
+    Flash_Update(127, 127, sum_sin2cos2_push_1_upper);
+    Flash_Update(127, 128, sum_sin2cos2_push_2_upper);
+    Flash_Update(127, 129, sum_sin2cos2_push_3_upper);
+    Flash_Update(127, 130, sum_sin2cos2_push_4_upper);
+
+    // 5. Flashメモリをロック
+    HAL_FLASH_Lock();
+}
+
 
 /* USER CODE END PFP */
 
@@ -804,7 +869,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+HAL_Init();
 
   /* USER CODE BEGIN Init */
   setvbuf(stdin, NULL, _IONBF, 0);    // scanf/printfに関する。バッファを初期化。
@@ -828,68 +893,21 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   /* Console(TeraTerm)立ち上げ時に表示 */
-  printf("Welcome to the interactive command prompt.\n");
+  printf("\nWelcome to the interactive command prompt.\r\n");
 
   /* Device ID読み出せたら、Addr0x21にData0x10でPower-downモード以外に入って出力モニタできるようになる */
-  HAL_I2C_Mem_Write(&hi2c1, dev_address_1<<1, 0x21, 1, cntl_w, 1, 1000);
-  HAL_I2C_Mem_Write(&hi2c1, dev_address_2<<1, 0x21, 1, cntl_w, 1, 1000);
+  if (HAL_I2C_Mem_Write(&hi2c1, dev_address_1<<1, 0x21, 1, cntl_w, 1, 1000) != HAL_OK) {
+	  printf("I2C communication was failed.");
+  }
+  if (HAL_I2C_Mem_Write(&hi2c1, dev_address_2<<1, 0x21, 1, cntl_w, 1, 1000) != HAL_OK) {
+	  printf("I2C communication was failed.");
+  }
 
-  /* キャリブデータなどをEEPROMからバッファに読み出す */
-  eeprom_read();
+  // flashの値をバッファに格納
+  load_from_flash();
 
   /* バッファの値を各変数に定義 */
-//  tolerance = eeprom[0];				// 10　が基本。toleranceは初期値設定されているが、ここでEEPROM格納値に更新される。
-//  center_push_threshold = eeprom[1];	//　2.7 が基本。center_push_thresholdは初期値設定されているが、ここでEEPROM格納値に更新される。
-//  left_tilt_threshold = eeprom[2];		//　-1.2　が基本。left_tilt_thresholdは初期値設定されているが、ここでEEPROM格納値に更新される。
-//  right_tilt_threshold = eeprom[3];		//　1.2　が基本。right_tilt_thresholdは初期値設定されているが、ここでEEPROM格納値に更新される。
-
   tolerance = 10;				// 10　が基本。toleranceは初期値設定されているが、ここでEEPROM格納値に更新される。
-  center_push_threshold = 2.7;	//　2.7 が基本。center_push_thresholdは初期値設定されているが、ここでEEPROM格納値に更新される。
-  left_tilt_threshold = -1.2;		//　-1.2　が基本。left_tilt_thresholdは初期値設定されているが、ここでEEPROM格納値に更新される。
-  right_tilt_threshold = 1.2;		//　1.2　が基本。right_tilt_thresholdは初期値設定されているが、ここでEEPROM格納値に更新される。
-
-  for (int i=0; i<16; i++) {
-	  s1_raw_bx[i] = eeprom[4+i];
-	  s1_raw_by[i] = eeprom[20+i];
-	  s1_raw_bz[i] = eeprom[36+i];
-	  s2_raw_bx[i] = eeprom[52+i];
-	  s2_raw_by[i] = eeprom[68+i];
-	  s2_raw_bz[i] = eeprom[84+i];
-  }
-
-  s1_raw_bx_p2p = eeprom[100];
-  s1_raw_by_p2p = eeprom[101];
-  s1_raw_bz_p2p = eeprom[102];
-  s1_raw_bx_offset = eeprom[103];
-  s1_raw_by_offset = eeprom[104];
-  s1_raw_bz_offset = eeprom[105];
-  s2_raw_bx_p2p = eeprom[106];
-  s2_raw_by_p2p = eeprom[107];
-  s2_raw_bz_p2p = eeprom[108];
-  s2_raw_bx_offset = eeprom[109];
-  s2_raw_by_offset = eeprom[110];
-  s2_raw_bz_offset = eeprom[111];
-
-  for (int i=0; i<16; i++) {
-	  s1_std_bx[i] = eeprom[112+i];
-	  s1_std_by[i] = eeprom[128+i];
-	  s1_std_bz[i] = eeprom[144+i];
-	  s2_std_bx[i] = eeprom[160+i];
-	  s2_std_by[i] = eeprom[176+i];
-	  s2_std_bz[i] = eeprom[192+i];
-	  s1_atan[i] = eeprom[208+i];
-	  s2_atan[i] = eeprom[224+i];
-	  s1_std_bx_sign[i] = eeprom[240+i];
-	  s2_std_bx_sign[i] = eeprom[256+i];
-	  s1_theta[i] = eeprom[272+i];
-	  s2_theta[i] = eeprom[288+i];
-	  s1_theta_low[i] = eeprom[304+i];
-	  s2_theta_low[i] = eeprom[320+i];
-	  s1_theta_high[i] = eeprom[336+i];
-	  s2_theta_high[i] = eeprom[352+i];
-  }
-  //合計 8 bytes x 368 変数 = 2,944 bytes
-
 
   /* USER CODE END 2 */
 
@@ -900,27 +918,30 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  printf("\n");
-	  printf("1:calibration\n");
-	  printf("2:store memory\n");
-	  printf("3:read eeprom\n");
-	  printf("4:sensitivity adjustment\n");
-	  printf("5:operation\n");
-	  printf("6:exit\n");
+	  printf("1:calibration\r\n");
+	  printf("2:store value from buffer to flash memory\r\n");
+	  printf("3:load value from flash memory to buffer\r\n");
+	  printf("4:tolerance setting\r\n");
+	  printf("5:operation\r\n");
+	  printf("6:exit\r\n");
+	  printf("7:just read flash memory\r\n");
 	  scanf("%s", input);
 
       if (strcmp(input, "1") == 0) {
           calibration();
       } else if (strcmp(input, "2") == 0) {
-    	  eeprom_write();
+    	  store_to_flash();
       } else if (strcmp(input, "3") == 0) {
-    	  eeprom_read();
-    	  printf("\n");
-    	  for(int i=0; i<368; i++) {
-    		  printf("eeprom[%d]   %f\n",i,eeprom[i]);
+    	  load_from_flash();
+    	  printf("\r\n");
+    	  for(int i=0; i<256; i++) {
+    		  printf("page:126, address:%d, data:%lf\r\n",i,Flash_Read(126,i));
+    	  }
+    	  for(int i=0; i<256; i++) {
+    		  printf("page:127, address:%d, data:%lf\r\n",i,Flash_Read(127,i));
     	  }
       } else if (strcmp(input, "4") == 0) {
-    	  sense_adjust();
+    	  tolerance_setting();
       } else if (strcmp(input, "5") == 0) {
     	  while (1) {
     		  operation();
@@ -928,8 +949,16 @@ int main(void)
     	  }
       } else if (strcmp(input, "6") == 0) {
     	  com_debug();
+      } else if (strcmp(input, "7") == 0) {
+    	  printf("\r\n");
+    	  for(int i=0; i<256; i++) {
+    		  printf("page:126, address:%d, data:%lf\r\n",i,Flash_Read(126,i));
+    	  }
+    	  for(int i=0; i<256; i++) {
+    		  printf("page:127, address:%d, data:%lf\r\n",i,Flash_Read(127,i));
+    	  }
       } else {
-          printf("\nInvalid command.\n");
+          printf("Invalid command.\r\n");
       }
 
 	  HAL_Delay (100);
