@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32l4xx_hal.h"
+#include "pram.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -54,60 +55,13 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
-/* グローバル変数を設定する */
 uint8_t dev_address_1 = 0x10;    /* sensor1のスレーブアドレス */
 uint8_t dev_address_2 = 0x11;    /* sensor2のスレーブアドレス */
 uint8_t eeprom_address = 0x50;    /* eepromのスレーブアドレス,0b1010000 */
 
-int16_t s1_raw_bx[16], s1_raw_by[16], s1_raw_bz[16];    /* calibration時の7byte生データからBx, By, Bzを抽出し格納 sensor1側 */
-int16_t s2_raw_bx[16], s2_raw_by[16], s2_raw_bz[16];    /* calibration時の7byte生データからBx, By, Bzを抽出し格納 sensor2側 */
-double s1_raw_bx_p2p, s1_raw_by_p2p, s1_raw_bz_p2p;    /* calibration時のBx,By,Bzのpeak-to-peak sensor1側 */
-double s2_raw_bx_p2p, s2_raw_by_p2p, s2_raw_bz_p2p;    /* calibration時のBx,By,Bzのpeak-to-peak sensor2側 */
-double s1_raw_bx_offset, s1_raw_by_offset, s1_raw_bz_offset;    /* calibration時のBx,By,Bzのoffset sensor1側 */
-double s2_raw_bx_offset, s2_raw_by_offset, s2_raw_bz_offset;    /* calibration時のBx,By,Bzのoffset sensor2側 */
-double s1_std_bx[16], s1_std_by[16], s1_std_bz[16];    /* calibration時のBx,By,Bzをオフセットを減算して振幅で除算してピークピークが+/-1の波形となるよう規格化 sensor1側*/
-double s2_std_bx[16], s2_std_by[16], s2_std_bz[16];    /* calibration時のBx,By,Bzをオフセットを減算して振幅で除算してピークピークが+/-1の波形となるよう規格化 sensor2側*/
-
-double s1_atan[16];    /* stdからatan算出 sensor1側 */
-double s2_atan[16];    /* stdからatan算出 sensor2側 */
-
-uint8_t s1_std_bx_sign[16];    /* std_bxの正負でエリア分け（正=1, 負=0） sensor1側 */
-uint8_t s2_std_bx_sign[16];    /* std_bxの正負でエリア分け（正=1, 負=0） sensor2側 */
-
-double s1_theta[16];    /* calibration時のstdからatanでΘ(theta)を算出　sensor1側 */
-double s2_theta[16];    /* calibration時のstdからatanでΘ(theta)を算出　sensor2側 */
-double s1_theta_low[16];    /* calibration時のstdからatanでΘ(theta)を算出し、toleranceを減算した値　sensor1側 */
-double s2_theta_low[16];    /* calibration時のstdからatanでΘ(theta)を算出し、toleranceを減算した値　sensor2側 */
-double s1_theta_high[16];    /* calibration時のstdからatanでΘ(theta)を算出し、toleranceを加算した値　sensor1側 */
-double s2_theta_high[16];    /* calibration時のstdからatanでΘ(theta)を算出し、toleranceを加算した値　sensor2側 */
-
-/* calibration（） で使う　しきい値 */
-double tolerance;    /* 回転角度エリア判定の範囲を指定する変数 */
-
 /* EEPROM格納用配列 */
 double eeprom[1000];    /* すべて倍精度浮動小数点数型doubleで格納。ひとつの数値に8byte使う */
 double flash[512];  // flash2ページ分のアドレス512
-
-// 傾き・押し込み判定スレッショルド
-double dif_sin2cos2_s1_side_0_lower = 0.70;		// S1側 第1領域　下限
-double dif_sin2cos2_s1_side_0_upper = 0.95;		// S1側 第1領域　上限
-double dif_sin2cos2_s1_side_1_upper = 1.20;		// S1側 第2領域　上限
-double dif_sin2cos2_s1_side_2_upper = 1.45;		// S1側 第3領域　上限
-double dif_sin2cos2_s1_side_3_upper = 1.70;		// S1側 第4領域　上限
-double dif_sin2cos2_s1_side_4_upper = 10;		// S1側 第5領域　上現
-double dif_sin2cos2_s2_side_0_upper = -0.70;	// S2側 第1領域　上限
-double dif_sin2cos2_s2_side_0_lower = -0.95;	// S2側　第1領域　下限
-double dif_sin2cos2_s2_side_1_lower = -1.20;	// S2側　第2領域　下限
-double dif_sin2cos2_s2_side_2_lower = -1.45;	// S2側　第3領域　下限
-double dif_sin2cos2_s2_side_3_lower = -1.70;	// S2側　第4領域　下限
-double dif_sin2cos2_s2_side_4_lower = -10;		// S2側　第5領域　下限
-double sum_sin2cos2_push_0_lower = 2.75;	// 押し込み 第1領域 下限
-double sum_sin2cos2_push_0_upper = 3.00;	// 押し込み 第1領域 上限
-double sum_sin2cos2_push_1_upper = 3.25;	// 押し込み 第2領域 上限
-double sum_sin2cos2_push_2_upper = 3.50;	// 押し込み 第3領域 上限
-double sum_sin2cos2_push_3_upper = 3.75;	// 押し込み 第4領域 上限
-double sum_sin2cos2_push_4_upper = 10;		// 押し込み 第5領域 上限
 
 /* USER CODE END PV */
 
@@ -908,7 +862,6 @@ HAL_Init();
 
   /* バッファの値を各変数に定義 */
   tolerance = 10;				// 10　が基本。toleranceは初期値設定されているが、ここでEEPROM格納値に更新される。
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
